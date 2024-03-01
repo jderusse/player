@@ -1,0 +1,139 @@
+name: build_spc_canary_spc
+
+on:
+  pull_request
+
+env:
+  box_version: 4.6.1
+  php_version: 8.2
+  php_extensions: mbstring,phar,posix,tokenizer,curl,ctype,dom,xmlwriter,openssl,intl,zip,uuid
+
+# on:
+#   push:
+#     branches:
+#       - 'master'
+
+jobs:
+  phar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PHP for official runners
+        uses: shivammathur/setup-php@v2
+        with:
+          coverage: none
+          tools: composer:v2
+          php-version: ${{ env.php_version }}
+          ini-values: phar.readonly=0
+
+      - name: Get Composer Cache Directory
+        id: composer-cache
+        run: |
+          echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: php-${{ env.php_version }}-locked-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            php-${{ env.php_version }}-locked-composer
+
+      - run: composer install --no-dev --classmap-authoritative
+
+      - id: cache-box
+        uses: actions/cache@v4
+        with:
+          path: bin/tools/box
+          key: box-${{ env.box_version }}
+      - if: steps.cache-box.outputs.cache-hit != 'true'
+        name: Download box
+        run: |
+          mkdir -p bin/tools
+          curl --fail --location -o bin/tools/box https://github.com/box-project/box/releases/download/${{ env.box_version }}/box.phar
+          chmod +x bin/tools/box
+
+      - name: Generate phar file
+        run: |
+          ./bin/tools/box compile -c box.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackfire-player.phar
+          path: blackfire-player.phar
+
+
+  soc:
+    name: "Build ${{ matrix.os }} ${{ matrix.arch }}"
+    needs:
+    - phar
+    strategy:
+      matrix:
+        include:
+        - runner: ubuntu-latest
+          os: linux
+          arch: x86_64
+        - runner: macos-latest
+          os: macos
+          arch: x86_64
+        # - runner: ubuntu-latest
+        #   os: linux
+        #   arch: aarch64
+        # - runner: macos-14
+        #   os: macos
+        #   arch: aarch64
+    
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Download phar file
+      - uses: actions/download-artifact@v4
+        with:
+          name: blackfire-player.phar
+          path: build
+
+      - name: Download SPC bin artifact for self-hosted runners
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          repo: crazywhalecc/static-php-cli
+          branch: main
+          workflow: release-build.yml
+          name: spc-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Validate SPC bin
+        run: |
+          chmod +x spc
+          ./spc --version
+
+      - id: cache-downloads
+        uses: actions/cache@v4
+        with:
+          path: downloads
+          key: php-${{ env.php_version }}
+      - if: steps.cache-downloads.outputs.cache-hit != 'true'
+        name: Download php/extensions sources
+        run: CACHE_API_EXEC=yes ./spc download --with-php=${{ env.php_version }} --for-extensions=${{ env.php_extensions }}
+
+      - id: cache-buildroot
+        uses: actions/cache@v4
+        with:
+          path: buildroot/bin
+          key: sfx-${{ env.php_version }}-${{ matrix.os }}-${{ matrix.arch }}
+      - if: steps.cache-buildroot.outputs.cache-hit != 'true'
+        name: Build php and extensions
+        run: |
+          ./spc doctor --auto-fix
+          ./spc build ${{ env.php_extensions }} --build-micro --with-micro-fake-cli --arch=${{ matrix.arch }} 
+
+      # combine phar and spf files
+      - name: Combine php runtime and phar file
+        run: |
+          ./spc micro:combine ./build/blackfire-player.phar --output=blackfire-player-${{ matrix.os }}-${{ matrix.arch }}
+          chmod +x blackfire-player-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackfire-player-${{ matrix.os }}-${{ matrix.arch }}
+          path: blackfire-player-${{ matrix.os }}-${{ matrix.arch }}
